@@ -9,13 +9,57 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+
+DeviceLike = Union[str, torch.device]
+
+
+def _resolve_device(
+    device: Optional[DeviceLike] = None,
+    model: Optional[nn.Module] = None,
+    coords: Optional[Tensor] = None,
+) -> torch.device:
+    """Return ``device``, else CUDA when available, else the model's device."""
+    if device is not None:
+        return torch.device(device)
+    if coords is not None and coords.is_cuda:
+        return coords.device
+    if model is not None:
+        model_device = next(model.parameters()).device
+        if model_device.type == "cuda":
+            return model_device
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return model_device
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _to_device(tensor: Optional[Tensor], device: torch.device) -> Optional[Tensor]:
+    if tensor is None:
+        return None
+    if tensor.device == device:
+        return tensor
+    return tensor.to(device, non_blocking=device.type == "cuda")
+
+
+def _configure_cuda() -> None:
+    """Prefer fast GPU matmuls; TF32 is a tiny precision trade for large GEMMs."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except (AttributeError, RuntimeError):
+        pass
 
 
 def set_seed(seed: int = 7) -> None:
@@ -75,8 +119,24 @@ class SpatialBasis(nn.Module):
             r = 2.0**-0.5
             directions += [[r, r], [r, -r]]
             direction_names += ["diag+", "diag-"]
-        self.register_buffer("directions", torch.tensor(directions))
+        self.register_buffer("directions", torch.tensor(directions, dtype=torch.float32))
         self.config = config
+        self.register_buffer(
+            "sigmoid_slopes",
+            torch.tensor(config.sigmoid_slopes, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "sigmoid_offsets",
+            torch.tensor(config.sigmoid_offsets, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "exp_rates",
+            torch.tensor(config.exp_rates, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "frequencies",
+            torch.tensor(config.frequencies, dtype=torch.float32),
+        )
 
         names, families = ["constant"], ["constant"]
         names += [f"linear:{direction_names[0]}", f"linear:{direction_names[1]}"]
@@ -131,22 +191,34 @@ class SpatialBasis(nn.Module):
         if directions.ndim != 2 or directions.shape[1] != 2:
             raise ValueError("directions must have shape [n_axes, 2]")
         projections = coords @ directions.T
+        n_spots, n_axes = projections.shape
+        per_axis: List[Tensor] = []
+        # Keep the original layout: for each axis, sigmoids then decays then Fourier.
+        if self.sigmoid_slopes.numel() and self.sigmoid_offsets.numel():
+            sigmoid = torch.sigmoid(
+                self.sigmoid_slopes[None, None, :, None]
+                * (
+                    projections[:, :, None, None]
+                    - self.sigmoid_offsets[None, None, None, :]
+                )
+            )
+            per_axis.append(sigmoid.reshape(n_spots, n_axes, -1))
+        if self.exp_rates.numel():
+            z = projections[:, :, None]
+            rates = self.exp_rates[None, None, :]
+            plus = torch.exp(-rates * F.softplus(z))
+            minus = torch.exp(-rates * F.softplus(-z))
+            per_axis.append(torch.stack((plus, minus), dim=-1).reshape(n_spots, n_axes, -1))
+        if self.frequencies.numel():
+            angle = torch.pi * self.frequencies[None, None, :] * projections[:, :, None]
+            per_axis.append(
+                torch.stack((torch.sin(angle), torch.cos(angle)), dim=-1).reshape(
+                    n_spots, n_axes, -1
+                )
+            )
         columns = [torch.ones_like(coords[:, :1]), projections[:, :1], projections[:, 1:2]]
-
-        for direction_idx in range(directions.shape[0]):
-            z = projections[:, direction_idx : direction_idx + 1]
-            for slope in self.config.sigmoid_slopes:
-                for offset in self.config.sigmoid_offsets:
-                    columns.append(torch.sigmoid(slope * (z - offset)))
-            for rate in self.config.exp_rates:
-                # Include both orientations; unlike sigmoid/Fourier pairs, one
-                # decay direction cannot be reconstructed from the other.
-                columns.append(torch.exp(-rate * F.softplus(z)))
-                columns.append(torch.exp(-rate * F.softplus(-z)))
-            for frequency in self.config.frequencies:
-                angle = torch.pi * frequency * z
-                columns.extend([torch.sin(angle), torch.cos(angle)])
-
+        if per_axis:
+            columns.append(torch.cat(per_axis, dim=2).reshape(n_spots, -1))
         return torch.cat(columns, dim=1)
 
     def _standardization_stats(self, directions: Tensor) -> Tuple[Tensor, Tensor]:
@@ -233,6 +305,14 @@ class ConsensusSpatialMoE(nn.Module):
         )
         # Used only by the negative-binomial likelihood.
         self.log_inverse_dispersion = nn.Parameter(torch.full((n_genes,), 2.0))
+        group_keys = _basis_group_keys(self)
+        unique_keys = sorted(set(group_keys))
+        key_to_id = {key: idx for idx, key in enumerate(unique_keys)}
+        self.register_buffer(
+            "coefficient_group_ids",
+            torch.tensor([key_to_id[key] for key in group_keys], dtype=torch.long),
+        )
+        self.n_coefficient_groups = len(unique_keys)
 
     def axis_directions(self) -> Tensor:
         """Return the orthonormal axes used by the expert dictionary."""
@@ -253,11 +333,10 @@ class ConsensusSpatialMoE(nn.Module):
         if not self.gate_fourier_frequencies:
             return coords
         projections = coords @ self.gate_directions.T
-        features = [coords]
-        for frequency in self.gate_fourier_frequencies:
-            angle = torch.pi * frequency * projections
-            features.extend([torch.sin(angle), torch.cos(angle)])
-        return torch.cat(features, dim=1)
+        frequencies = coords.new_tensor(self.gate_fourier_frequencies)
+        angle = torch.pi * frequencies[None, :, None] * projections[:, None, :]
+        sincos = torch.stack((torch.sin(angle), torch.cos(angle)), dim=2)
+        return torch.cat([coords, sincos.reshape(coords.shape[0], -1)], dim=1)
 
     def gate_logits(self, coords: Tensor) -> Tensor:
         return self.gate_network(self.gate_features(coords))
@@ -266,18 +345,27 @@ class ConsensusSpatialMoE(nn.Module):
         tau = self.temperature if temperature is None else temperature
         return F.softmax(self.gate_logits(coords) / max(float(tau), 1e-3), dim=1)
 
-    def expert_outputs(self, coords: Tensor) -> Tensor:
+    def expert_outputs(
+        self, coords: Tensor, coefficients: Optional[Tensor] = None
+    ) -> Tensor:
         """Return all expert values with shape [spot, domain, gene]."""
+        if coefficients is None:
+            coefficients = self.coefficients()
         phi = self.basis(coords, directions=self.axis_directions())
-        varying = torch.einsum("nb,pgb->npg", phi[:, 1:], self.coefficients())
+        varying = torch.einsum("nb,pgb->npg", phi[:, 1:], coefficients)
         return varying + self.intercepts.unsqueeze(0)
 
     def forward(
-        self, coords: Tensor, temperature: Optional[float] = None
+        self,
+        coords: Tensor,
+        temperature: Optional[float] = None,
+        coefficients: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Return mixed expression, soft gates and every expert's expression."""
+        if coefficients is None:
+            coefficients = self.coefficients()
         gates = self.gates(coords, temperature)
-        experts = self.expert_outputs(coords)
+        experts = self.expert_outputs(coords, coefficients=coefficients)
         prediction = torch.einsum("np,npg->ng", gates, experts)
         return prediction, gates, experts
 
@@ -374,15 +462,20 @@ def _basis_group_keys(model: ConsensusSpatialMoE) -> List[str]:
     return keys
 
 
-def _family_group_penalty(model: ConsensusSpatialMoE) -> Tensor:
-    coefficients = model.coefficients()
-    keys = _basis_group_keys(model)
-    penalty = coefficients.new_zeros(())
-    for key in sorted(set(keys)):
-        indices = [idx for idx, value in enumerate(keys) if value == key]
-        group = coefficients[:, :, indices]
-        penalty = penalty + torch.sqrt(group.square().sum(dim=-1) + 1e-8).mean()
-    return penalty
+def _family_group_penalty(
+    model: ConsensusSpatialMoE, coefficients: Optional[Tensor] = None
+) -> Tensor:
+    if coefficients is None:
+        coefficients = model.coefficients()
+    grouped = coefficients.new_zeros(
+        coefficients.shape[0], coefficients.shape[1], model.n_coefficient_groups
+    )
+    grouped.scatter_add_(
+        -1,
+        model.coefficient_group_ids.view(1, 1, -1).expand_as(coefficients),
+        coefficients.square(),
+    )
+    return torch.sqrt(grouped + 1e-8).mean(dim=(0, 1)).sum()
 
 
 def _boundary_regularizers(
@@ -394,47 +487,81 @@ def _boundary_regularizers(
     min_changed_fraction: float,
     change_threshold: float,
     change_temperature: float,
+    coefficients: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Return spatial TV, fused-gene and consensus-support penalties."""
     source, target = edges
-    boundary_probability = 1.0 - (gates[source] * gates[target]).sum(dim=1)
-    spatial_tv = boundary_probability.mean()
+    gates_source = gates[source]
+    gates_target = gates[target]
+    spatial_tv = (1.0 - (gates_source * gates_target).sum(dim=1)).mean()
 
+    if coefficients is None:
+        coefficients = model.coefficients()
     midpoints = 0.5 * (coords[source] + coords[target])
-    midpoint_experts = model.expert_outputs(midpoints)
-    fused = coords.new_zeros(())
+    if coords.is_cuda:
+        from torch.utils.checkpoint import checkpoint
+
+        midpoint_experts = checkpoint(
+            model.expert_outputs,
+            midpoints,
+            coefficients,
+            use_reentrant=False,
+        )
+    else:
+        midpoint_experts = model.expert_outputs(midpoints, coefficients=coefficients)
+
+    pair_p, pair_q = torch.triu_indices(
+        model.n_domains,
+        model.n_domains,
+        offset=1,
+        device=coords.device,
+    )
+    n_pairs = int(pair_p.numel())
+    if n_pairs == 0:
+        zero = coords.new_zeros(())
+        return spatial_tv, zero, zero
+
+    crossing = (
+        gates_source[:, pair_p] * gates_target[:, pair_q]
+        + gates_source[:, pair_q] * gates_target[:, pair_p]
+    )
+    mass = crossing.sum(dim=0)
+    coefficient_jump = (coefficients[pair_p] - coefficients[pair_q]).abs().mean(dim=-1)
+    intercept_jump = (model.intercepts[pair_p] - model.intercepts[pair_q]).abs()
+    gene_jump = (coefficient_jump + intercept_jump).mean(dim=-1)
+    fused = (mass * gene_jump).sum()
+
+    scale = gene_scale.clamp_min(1e-4)
+    n_edges, n_genes = midpoint_experts.shape[0], midpoint_experts.shape[2]
+    bytes_per_pair = max(n_edges * n_genes * midpoint_experts.element_size(), 1)
+    if coords.is_cuda:
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(coords.device)
+        except TypeError:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        # Indexed copies, abs, sigmoid, and autograd each need their own slice.
+        pair_chunk = max(1, int(free_bytes * 0.10) // (bytes_per_pair * 8))
+        pair_chunk = max(1, min(n_pairs, pair_chunk))
+    else:
+        pair_chunk = max(1, min(n_pairs, 16_000_000 // max(n_edges * n_genes, 1)))
     consensus = coords.new_zeros(())
-    total_crossing_mass = coords.new_zeros(())
+    for start in range(0, n_pairs, pair_chunk):
+        sl = slice(start, start + pair_chunk)
+        idx_p = pair_p[sl]
+        idx_q = pair_q[sl]
+        jumps = (
+            midpoint_experts.index_select(1, idx_p)
+            - midpoint_experts.index_select(1, idx_q)
+        ).abs()
+        changed = torch.sigmoid(
+            (jumps / scale - change_threshold) / change_temperature
+        )
+        changed_fraction = changed.mean(dim=-1)
+        consensus = consensus + (
+            crossing[:, sl] * F.relu(min_changed_fraction - changed_fraction).square()
+        ).sum()
 
-    for p in range(model.n_domains):
-        for q in range(p + 1, model.n_domains):
-            crossing = gates[source, p] * gates[target, q]
-            crossing = crossing + gates[source, q] * gates[target, p]
-            mass = crossing.sum()
-            if float(mass.detach()) < 1e-8:
-                continue
-            jumps = (midpoint_experts[:, p] - midpoint_experts[:, q]).abs()
-            scaled_jumps = jumps / gene_scale[None, :].clamp_min(1e-4)
-            changed = torch.sigmoid(
-                (scaled_jumps - change_threshold) / change_temperature
-            )
-            changed_fraction = changed.mean(dim=1)
-            consensus = consensus + (
-                crossing
-                * F.relu(min_changed_fraction - changed_fraction).square()
-            ).sum()
-
-            # L1 fusion gives exact-ish "unchanged gene" solutions; data fit and
-            # the consensus hinge retain a sparse set of radical changes.
-            coefficient_jump = (
-                model.coefficients()[p] - model.coefficients()[q]
-            ).abs().mean(dim=1)
-            intercept_jump = (model.intercepts[p] - model.intercepts[q]).abs()
-            gene_jump = coefficient_jump + intercept_jump
-            fused = fused + mass * gene_jump.mean()
-            total_crossing_mass = total_crossing_mass + mass
-
-    normalizer = total_crossing_mass.clamp_min(1e-6)
+    normalizer = mass.sum().clamp_min(1e-6)
     return spatial_tv, fused / normalizer, consensus / normalizer
 
 
@@ -460,7 +587,8 @@ def consensus_moe_loss(
     """
     if edges is None:
         edges = spatial_edges(coords)
-    prediction, gates, _ = model(coords, temperature)
+    coefficients = model.coefficients()
+    prediction, gates, _ = model(coords, temperature, coefficients=coefficients)
     if likelihood == "gaussian":
         if observation_variance is None:
             reconstruction = F.mse_loss(prediction, expression)
@@ -489,12 +617,13 @@ def consensus_moe_loss(
         min_changed_fraction,
         change_threshold,
         change_temperature,
+        coefficients=coefficients,
     )
     entropy = -(gates.clamp_min(1e-8) * gates.clamp_min(1e-8).log()).sum(1).mean()
     usage = gates.mean(dim=0)
     balance = ((usage - 1.0 / model.n_domains) ** 2).mean()
-    ridge = model.coefficients().square().mean()
-    group_lasso = _family_group_penalty(model)
+    ridge = coefficients.square().mean()
+    group_lasso = _family_group_penalty(model, coefficients)
 
     terms = {
         "reconstruction": reconstruction,
@@ -556,43 +685,38 @@ def initialize_experts_from_ridge(
     """Warm-start low-rank experts from weighted per-domain basis regression."""
     labels = labels.to(device=coords.device, dtype=torch.long)
     design = model.basis(coords, directions=model.axis_directions())
-    identity = torch.eye(
-        design.shape[1], device=design.device, dtype=design.dtype
-    )
-    identity[0, 0] = 0.0  # do not shrink the intercept
+    n_basis = design.shape[1]
+    counts = torch.bincount(labels, minlength=model.n_domains)
+    if int(counts.min()) < n_basis:
+        raise ValueError("each initialized domain needs at least n_basis spots")
 
-    for domain in range(model.n_domains):
-        selected = labels == domain
-        if int(selected.sum()) < design.shape[1]:
-            raise ValueError("each initialized domain needs at least n_basis spots")
-        domain_design = design[selected]
-        coefficients = []
-        for gene in range(model.n_genes):
-            if observation_variance is None:
-                weight = torch.ones_like(expression[selected, gene])
-            else:
-                weight = observation_variance[selected, gene].reciprocal()
-            weighted_design = domain_design * weight.sqrt()[:, None]
-            weighted_target = expression[selected, gene] * weight.sqrt()
-            beta = torch.linalg.solve(
-                weighted_design.T @ weighted_design + ridge * identity,
-                weighted_design.T @ weighted_target,
-            )
-            coefficients.append(beta)
-        coefficients_tensor = torch.stack(coefficients, dim=1)
-        model.intercepts[domain].copy_(coefficients_tensor[0])
-        theta = coefficients_tensor[1:].T
-        left, singular_values, right = torch.linalg.svd(theta, full_matrices=False)
-        retained_rank = min(model.rank, singular_values.numel())
-        root_singular = singular_values[:retained_rank].sqrt()
-        model.gene_loadings[domain].zero_()
-        model.profile_atoms[domain].zero_()
-        model.gene_loadings[domain, :, :retained_rank].copy_(
-            left[:, :retained_rank] * root_singular[None, :]
-        )
-        model.profile_atoms[domain, :retained_rank].copy_(
-            root_singular[:, None] * right[:retained_rank]
-        )
+    identity = torch.eye(n_basis, device=design.device, dtype=design.dtype)
+    identity[0, 0] = 0.0  # do not shrink the intercept
+    mask = F.one_hot(labels, model.n_domains).to(dtype=design.dtype)
+
+    if observation_variance is None:
+        gram = torch.einsum("np,nb,nc->pbc", mask, design, design)
+        rhs = torch.einsum("np,nb,ng->pbg", mask, design, expression)
+        beta = torch.linalg.solve(gram + ridge * identity, rhs)
+    else:
+        weights = observation_variance.clamp_min(1e-8).reciprocal()
+        gram = torch.einsum("np,ng,nb,nc->pgbc", mask, weights, design, design)
+        rhs = torch.einsum("np,nb,ng->pgb", mask, design, weights * expression)
+        beta = torch.linalg.solve(gram + ridge * identity, rhs).permute(0, 2, 1)
+
+    model.intercepts.copy_(beta[:, 0, :])
+    theta = beta[:, 1:, :].transpose(1, 2)
+    left, singular_values, right = torch.linalg.svd(theta, full_matrices=False)
+    retained_rank = min(model.rank, singular_values.shape[-1])
+    root_singular = singular_values[:, :retained_rank].sqrt()
+    model.gene_loadings.zero_()
+    model.profile_atoms.zero_()
+    model.gene_loadings[:, :, :retained_rank].copy_(
+        left[:, :, :retained_rank] * root_singular[:, None, :]
+    )
+    model.profile_atoms[:, :retained_rank].copy_(
+        root_singular[:, :, None] * right[:, :retained_rank]
+    )
 
 
 @torch.no_grad()
@@ -661,6 +785,7 @@ def fit_consensus_moe(
     freeze_axes_epochs: int = 0,
     refit_experts_every: int = 0,
     refit_ridge: float = 0.3,
+    device: Optional[DeviceLike] = None,
 ) -> List[Dict[str, float]]:
     """Fit the model with exponential gate-temperature annealing.
 
@@ -668,9 +793,26 @@ def fit_consensus_moe(
     positive integer (for example 1 or 5). Closed-form ridge updates keep the
     expert coefficients near-optimal for the current frame, so the angle
     receives an envelope gradient instead of being absorbed into ``theta``.
+
+    Tensors and the model are moved to ``device``. By default this is CUDA when
+    a GPU is available, otherwise the model's current device. After fitting,
+    evaluate with coordinates on that same device.
     """
+    device = _resolve_device(device, model=model, coords=coords)
+    if device.type == "cuda":
+        _configure_cuda()
+    model.to(device)
+    coords = _to_device(coords, device)
+    expression = _to_device(expression, device)
+    if coords is None or expression is None:
+        raise ValueError("coords and expression are required")
+    library_size = _to_device(library_size, device)
+    observation_variance = _to_device(observation_variance, device)
     if edges is None:
         edges = spatial_edges(coords)
+    else:
+        edges = _to_device(edges, device)
+    model.train()
     gate_parameters = list(model.gate_network.parameters())
     axis_parameters = [] if model.axis_angle is None else [model.axis_angle]
     frozen_ids = {id(parameter) for parameter in gate_parameters}
@@ -701,6 +843,7 @@ def fit_consensus_moe(
     optimizer = torch.optim.Adam(parameter_groups)
     history: List[Dict[str, float]] = []
     progress = tqdm(range(epochs), desc="fit_consensus_moe", leave=True)
+    postfix_every = 1 if print_every <= 1 else min(print_every, 10)
     for epoch in progress:
         fraction = epoch / max(epochs - 1, 1)
         temperature = start_temperature * (end_temperature / start_temperature) ** fraction
@@ -720,7 +863,7 @@ def fit_consensus_moe(
                     observation_variance=observation_variance,
                     ridge=refit_ridge,
                 )
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss, terms = consensus_moe_loss(
             model,
             coords,
@@ -741,18 +884,35 @@ def fit_consensus_moe(
                 parameter.grad = None
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
-        progress.set_postfix(
-            recon=f"{float(terms['reconstruction'].detach()):.3f}",
-            loss=f"{float(terms['total'].detach()):.3f}",
-            temp=f"{temperature:.2f}",
-            refresh=False,
-        )
-        if epoch % print_every == 0 or epoch == epochs - 1:
-            row = {"epoch": float(epoch), "temperature": float(temperature)}
-            row.update({name: float(value.detach()) for name, value in terms.items()})
-            if model.axis_angle is not None:
-                row["axis_angle"] = float(model.axis_angle.detach())
-            history.append(row)
+        log_now = epoch % print_every == 0 or epoch == epochs - 1
+        postfix_now = epoch % postfix_every == 0 or epoch == epochs - 1
+        if log_now or postfix_now:
+            reconstruction = float(terms["reconstruction"].detach())
+            total = float(terms["total"].detach())
+            if postfix_now:
+                progress.set_postfix(
+                    recon=f"{reconstruction:.3f}",
+                    loss=f"{total:.3f}",
+                    temp=f"{temperature:.2f}",
+                    refresh=False,
+                )
+            if log_now:
+                row = {
+                    "epoch": float(epoch),
+                    "temperature": float(temperature),
+                    "reconstruction": reconstruction,
+                    "total": total,
+                }
+                row.update(
+                    {
+                        name: float(value.detach())
+                        for name, value in terms.items()
+                        if name not in row
+                    }
+                )
+                if model.axis_angle is not None:
+                    row["axis_angle"] = float(model.axis_angle.detach())
+                history.append(row)
     model.temperature = end_temperature
     return history
 
