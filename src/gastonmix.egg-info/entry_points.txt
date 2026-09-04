@@ -1,0 +1,2 @@
+[console_scripts]
+gaston = gastonmix.__main__:main
