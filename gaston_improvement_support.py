@@ -231,6 +231,8 @@ class SpatialBasis(nn.Module):
         self, coords: Tensor, directions: Optional[Tensor] = None
     ) -> Tensor:
         axes = self.directions if directions is None else directions
+        coords = coords.to(device=self.directions.device, dtype=self.directions.dtype)
+        axes = axes.to(device=self.directions.device, dtype=self.directions.dtype)
         phi = self._raw_basis(coords, axes)
         mean, scale = self._standardization_stats(axes)
         nonconstant = (phi[:, 1:] - mean) / scale
@@ -328,8 +330,21 @@ class ConsensusSpatialMoE(nn.Module):
         """Return non-constant coefficients with shape [domain, gene, basis]."""
         return torch.einsum("pgr,prb->pgb", self.gene_loadings, self.profile_atoms)
 
+    def _prepare_coords(self, coords: Tensor) -> Tensor:
+        """Copy coordinates onto the module device without mutating the input."""
+        target = self.intercepts
+        if coords.device == target.device and coords.dtype == target.dtype:
+            return coords
+        return coords.to(device=target.device, dtype=target.dtype)
+
+    def _match_device(self, tensor: Tensor, device: torch.device) -> Tensor:
+        if tensor.device == device:
+            return tensor
+        return tensor.to(device)
+
     def gate_features(self, coords: Tensor) -> Tensor:
         """Raw coordinates plus fixed multiscale Fourier gate features."""
+        coords = self._prepare_coords(coords)
         if not self.gate_fourier_frequencies:
             return coords
         projections = coords @ self.gate_directions.T
@@ -342,18 +357,23 @@ class ConsensusSpatialMoE(nn.Module):
         return self.gate_network(self.gate_features(coords))
 
     def gates(self, coords: Tensor, temperature: Optional[float] = None) -> Tensor:
+        source_device = coords.device
         tau = self.temperature if temperature is None else temperature
-        return F.softmax(self.gate_logits(coords) / max(float(tau), 1e-3), dim=1)
+        gates = F.softmax(self.gate_logits(coords) / max(float(tau), 1e-3), dim=1)
+        return self._match_device(gates, source_device)
 
     def expert_outputs(
         self, coords: Tensor, coefficients: Optional[Tensor] = None
     ) -> Tensor:
         """Return all expert values with shape [spot, domain, gene]."""
+        source_device = coords.device
+        coords = self._prepare_coords(coords)
         if coefficients is None:
             coefficients = self.coefficients()
         phi = self.basis(coords, directions=self.axis_directions())
         varying = torch.einsum("nb,pgb->npg", phi[:, 1:], coefficients)
-        return varying + self.intercepts.unsqueeze(0)
+        experts = varying + self.intercepts.unsqueeze(0)
+        return self._match_device(experts, source_device)
 
     def forward(
         self,
@@ -362,16 +382,24 @@ class ConsensusSpatialMoE(nn.Module):
         coefficients: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Return mixed expression, soft gates and every expert's expression."""
+        source_device = coords.device
+        coords = self._prepare_coords(coords)
         if coefficients is None:
             coefficients = self.coefficients()
         gates = self.gates(coords, temperature)
         experts = self.expert_outputs(coords, coefficients=coefficients)
         prediction = torch.einsum("np,npg->ng", gates, experts)
-        return prediction, gates, experts
+        return (
+            self._match_device(prediction, source_device),
+            self._match_device(gates, source_device),
+            self._match_device(experts, source_device),
+        )
 
     @torch.no_grad()
     def hard_domains(self, coords: Tensor) -> Tensor:
-        return self.gate_logits(coords).argmax(dim=1)
+        source_device = coords.device
+        labels = self.gate_logits(coords).argmax(dim=1)
+        return self._match_device(labels, source_device)
 
 
 @dataclass
